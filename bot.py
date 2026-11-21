@@ -44,6 +44,7 @@ SHOP_NAME_DEFAULT = os.getenv("SHOP_NAME", "SL1ZARA SHOP")
 DEFAULT_CHANNEL = os.getenv("CHANNEL", "@sl1zara")
 SUPPORT_DEFAULT = os.getenv("SUPPORT_USERNAME", "")  # без @
 CURRENCY = os.getenv("CURRENCY", "₽")
+MAX_PRICE = float(os.getenv("MAX_PRICE", "10000"))  # лимит платёжного провайдера на одну транзакцию
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 
 BOT_USERNAME = ""  # заполняется при старте
@@ -236,6 +237,40 @@ def url_button(text: str, url: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, url=url)
 
 
+DOCS = {
+    "terms": "📄 Пользовательское соглашение",
+    "privacy": "🔐 Политика конфиденциальности",
+}
+
+
+def is_url(v: str) -> bool:
+    return v.startswith("http://") or v.startswith("https://")
+
+
+def doc_button(key: str) -> InlineKeyboardButton:
+    value = get_setting(key)
+    if is_url(value):
+        return url_button(DOCS[key], value)
+    return InlineKeyboardButton(text=DOCS[key], callback_data=f"doc:{key}")
+
+
+def docs_rows() -> list[list[InlineKeyboardButton]]:
+    return [[doc_button(k)] for k in DOCS]
+
+
+def support_email() -> str:
+    return get_setting("support_email", "")
+
+
+def support_lines() -> str:
+    lines = []
+    if support_username():
+        lines.append(f"✈️ Telegram: @{escape(support_username())}")
+    if support_email():
+        lines.append(f"📧 Почта: {escape(support_email())}")
+    return "\n".join(lines)
+
+
 def product_text(p) -> str:
     text = f"🔥 <b>{escape(p['name'])}</b>\n{DIV}\n"
     if p["description"]:
@@ -289,12 +324,14 @@ def order_screen(o) -> tuple[str, InlineKeyboardMarkup]:
         f"💰 К оплате: {price_line}\n\n"
         f"💳 <b>Как оплатить</b>\n{escape(pay)}\n\n"
         f"✍️ В комментарии к переводу укажите номер заказа: <code>{o['id']}</code>\n"
-        f"После оплаты нажмите «Я оплатил»."
+        f"После оплаты нажмите «Я оплатил».\n\n"
+        f"<i>Оплачивая заказ, вы принимаете Пользовательское соглашение и Политику конфиденциальности.</i>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{o['id']}")],
             [InlineKeyboardButton(text="🎟 Ввести промокод", callback_data=f"promo:{o['id']}")],
+            *docs_rows(),
             [InlineKeyboardButton(text="🚫 Отменить заказ", callback_data=f"cancel:{o['id']}")],
         ]
     )
@@ -362,6 +399,8 @@ BTN_ORDERS = "📦 Мои заказы"
 BTN_PROFILE = "👤 Профиль"
 BTN_ABOUT = "ℹ️ О магазине"
 BTN_SUPPORT = "💬 Поддержка"
+BTN_PRICES = "💰 Цены и тарифы"
+BTN_DOCS = "📄 Документы"
 BTN_ADMIN = "⚙️ Админ-панель"
 
 
@@ -369,6 +408,7 @@ def main_kb(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text=BTN_CATALOG)],
         [KeyboardButton(text=BTN_ORDERS), KeyboardButton(text=BTN_PROFILE)],
+        [KeyboardButton(text=BTN_PRICES), KeyboardButton(text=BTN_DOCS)],
         [KeyboardButton(text=BTN_ABOUT), KeyboardButton(text=BTN_SUPPORT)],
     ]
     if is_admin(user_id):
@@ -439,7 +479,10 @@ class GateMiddleware(BaseMiddleware):
             return None
 
         if get_setting("force_sub") == "1":
-            if isinstance(event, CallbackQuery) and event.data == "chk_sub":
+            # документы, цены и поддержка доступны всем, даже без подписки (требование платёжной системы)
+            if isinstance(event, CallbackQuery) and (event.data in ("chk_sub", "docs") or event.data.startswith("doc:")):
+                return await handler(event, data)
+            if isinstance(event, Message) and event.text in (BTN_DOCS, BTN_PRICES, BTN_SUPPORT):
                 return await handler(event, data)
             if not await is_subscribed(data["bot"], user.id):
                 rows = []
@@ -472,6 +515,7 @@ async def send_welcome(target: Message, user_id: int) -> None:
     link = channel_link()
     if link:
         rows.append([url_button("📢 Наш канал", link)])
+    rows.append([InlineKeyboardButton(text="📄 Документы", callback_data="docs")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     banner = get_setting("banner")
     if banner:
@@ -559,6 +603,9 @@ async def cb_buy(cq: CallbackQuery):
         p = c.execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
         if not p:
             await cq.answer("Товар недоступен", show_alert=True)
+            return
+        if p["price"] > MAX_PRICE:
+            await cq.answer(f"Сумма превышает лимит {fmt_price(MAX_PRICE)}. Напишите в поддержку.", show_alert=True)
             return
         cur = c.execute(
             "INSERT INTO orders(user_id, product_id, product_name, price, orig_price, status, created_at, updated_at) "
@@ -705,25 +752,96 @@ async def profile(m: Message, state: FSMContext):
 async def about(m: Message, state: FSMContext):
     await state.clear()
     text = f"ℹ️ <b>О магазине {escape(shop_name())}</b>\n{DIV}\n{escape(get_setting('about', DEFAULT_ABOUT))}"
+    if support_lines():
+        text += f"\n\n💬 <b>Поддержка</b>\n{support_lines()}"
     rows = []
     link = channel_link()
     if link:
         rows.append([url_button("📢 Наш канал", link)])
     if support_username():
         rows.append([url_button("💬 Поддержка", f"https://t.me/{support_username()}")])
-    await m.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+    rows += docs_rows()
+    await m.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @user_router.message(F.text == BTN_SUPPORT)
 async def support(m: Message, state: FSMContext):
     await state.clear()
-    if support_username():
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[url_button("✉️ Написать в поддержку", f"https://t.me/{support_username()}")]]
-        )
-        await m.answer("💬 Остались вопросы? Мы на связи — нажмите кнопку ниже.", reply_markup=kb)
-    else:
+    if not support_lines():
         await m.answer("💬 Поддержка: напишите администратору магазина.")
+        return
+    rows = []
+    if support_username():
+        rows.append([url_button("✉️ Написать в Telegram", f"https://t.me/{support_username()}")])
+    await m.answer(
+        f"💬 <b>Поддержка {escape(shop_name())}</b>\n{DIV}\n"
+        f"Остались вопросы по заказу или оплате? Мы на связи:\n\n{support_lines()}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
+    )
+
+
+@user_router.message(F.text == BTN_PRICES)
+async def prices(m: Message, state: FSMContext):
+    await state.clear()
+    with db() as c:
+        items = c.execute("SELECT * FROM products WHERE active=1 ORDER BY price").fetchall()
+    if not items:
+        await m.answer("💰 <b>Цены и тарифы</b>\n\nТовары скоро появятся 🙂")
+        return
+    lines = [f"💰 <b>Цены и тарифы {escape(shop_name())}</b>\n{DIV}"]
+    for p in items:
+        line = f"\n🔹 <b>{escape(p['name'])}</b> — {fmt_price(p['price'])}"
+        if p["description"]:
+            desc = p["description"] if len(p["description"]) <= 200 else p["description"][:200] + "…"
+            line += f"\n<i>{escape(desc)}</i>"
+        lines.append(line)
+    lines.append(
+        f"\n{DIV}\nЦены указаны в рублях за единицу товара. Итоговая сумма показывается перед оплатой. "
+        "Оплачивая заказ, вы принимаете Пользовательское соглашение."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🛍 Открыть каталог", callback_data="catalog")], *docs_rows()]
+    )
+    await m.answer("\n".join(lines), reply_markup=kb)
+
+
+@user_router.message(F.text == BTN_DOCS)
+async def docs_menu(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer(
+        f"📄 <b>Документы {escape(shop_name())}</b>\n{DIV}\nВыберите документ:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=docs_rows()),
+    )
+
+
+@user_router.callback_query(F.data == "docs")
+async def cb_docs(cq: CallbackQuery):
+    await cq.message.answer(
+        f"📄 <b>Документы {escape(shop_name())}</b>\n{DIV}\nВыберите документ:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=docs_rows()),
+    )
+    await cq.answer()
+
+
+@user_router.callback_query(F.data.startswith("doc:"))
+async def cb_doc(cq: CallbackQuery):
+    key = cq.data.split(":")[1]
+    if key not in DOCS:
+        await cq.answer()
+        return
+    value = get_setting(key)
+    if not value:
+        await cq.answer("Документ скоро появится", show_alert=True)
+        return
+    if is_url(value):
+        await cq.message.answer(DOCS[key], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[url_button("Открыть", value)]]))
+    else:
+        title = f"<b>{DOCS[key]}</b>\n{DIV}\n"
+        body = escape(value)
+        chunks = [body[i : i + 3800] for i in range(0, len(body), 3800)]
+        for i, chunk in enumerate(chunks):
+            await cq.message.answer((title if i == 0 else "") + chunk)
+    await cq.answer()
 
 
 # ─────────────────────────── Админка ───────────────────────────
@@ -759,9 +877,12 @@ async def adm_cancel(cq: CallbackQuery, state: FSMContext):
 def parse_price(text: str) -> float | None:
     try:
         v = float(text.replace(",", ".").replace(" ", ""))
-        return v if v > 0 else None
+        return v if 0 < v <= MAX_PRICE else None
     except ValueError:
         return None
+
+
+PRICE_ERROR = f"Нужно число больше 0 и не больше {int(MAX_PRICE)} (лимит платёжной системы). Ещё раз:"
 
 
 # ── Добавление товара ──
@@ -786,14 +907,17 @@ async def add_desc(m: Message, state: FSMContext):
     desc = "" if m.text.strip() == "-" else m.text.strip()[:700]
     await state.update_data(description=desc)
     await state.set_state(AddProduct.price)
-    await m.answer(f"Шаг 3/4. Введите <b>цену</b> в {CURRENCY} (число, например 299):", reply_markup=cancel_kb())
+    await m.answer(
+        f"Шаг 3/4. Введите <b>цену</b> в {CURRENCY} (число, например 299, максимум {int(MAX_PRICE)}):",
+        reply_markup=cancel_kb(),
+    )
 
 
 @admin_router.message(AddProduct.price, F.text)
 async def add_price(m: Message, state: FSMContext):
     price = parse_price(m.text)
     if price is None:
-        await m.answer("Нужна положительная цифра, например <code>299</code>. Ещё раз:")
+        await m.answer(PRICE_ERROR)
         return
     await state.update_data(price=price)
     await state.set_state(AddProduct.photo)
@@ -943,7 +1067,7 @@ async def adm_edit_save(m: Message, state: FSMContext):
         if field == "price":
             value = parse_price(text)
             if value is None:
-                await m.answer("Нужна положительная цифра. Ещё раз:")
+                await m.answer(PRICE_ERROR)
                 return
         elif field == "description":
             value = "" if text == "-" else text[:700]
@@ -1087,7 +1211,27 @@ SETTINGS = {
     "banner": ("🖼 Баннер приветствия", "Отправьте фото-баннер для приветствия или <code>-</code>, чтобы убрать."),
     "about": ("ℹ️ О магазине", "Введите текст раздела «О магазине» (до 2000 символов):"),
     "payment_info": ("💳 Реквизиты оплаты", "Введите реквизиты и инструкцию по оплате:"),
-    "support": ("💬 Контакт поддержки", "Введите ник для кнопки поддержки (без @) или <code>-</code>, чтобы убрать:"),
+    "support": ("💬 Поддержка: Telegram", "Введите ник поддержки (без @) или <code>-</code>, чтобы убрать:"),
+    "support_email": ("📧 Поддержка: почта", "Введите почту поддержки или <code>-</code>, чтобы убрать:"),
+    "terms": (
+        "📄 Соглашение",
+        "Отправьте <b>ссылку</b> на Пользовательское соглашение (например, статью telegra.ph) "
+        "или <b>сам текст</b> одним сообщением (до 4000 символов). <code>-</code> — удалить.",
+    ),
+    "privacy": (
+        "🔐 Политика",
+        "Отправьте <b>ссылку</b> на Политику конфиденциальности (например, статью telegra.ph) "
+        "или <b>сам текст</b> одним сообщением (до 4000 символов). <code>-</code> — удалить.",
+    ),
+    "bot_description": (
+        "📝 Описание бота",
+        "Введите описание бота (до 512 символов). Его видят все, кто открывает бота до нажатия «Старт». "
+        "Сюда можно добавить кодовое слово для проверки платёжной системы. <code>-</code> — очистить.",
+    ),
+    "bot_short": (
+        "🏷 Краткое описание",
+        "Введите краткое описание (до 120 символов). Оно показывается в профиле бота. <code>-</code> — очистить.",
+    ),
 }
 
 
@@ -1098,8 +1242,15 @@ def settings_kb() -> InlineKeyboardMarkup:
     sub = "🟢 включена" if get_setting("force_sub") == "1" else "⚪️ выключена"
     b.button(text=f"🔒 Обязательная подписка: {sub}", callback_data="adm:forcesub")
     b.button(text="« Назад", callback_data="adm:menu")
-    b.adjust(2, 2, 2, 1, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 1, 1)
     return b.as_markup()
+
+
+def doc_status(key: str) -> str:
+    v = get_setting(key)
+    if not v:
+        return "❌ не добавлено"
+    return "🔗 ссылка" if is_url(v) else f"📝 текст ({len(v)} симв.)"
 
 
 def settings_text() -> str:
@@ -1107,8 +1258,13 @@ def settings_text() -> str:
         f"⚙️ <b>Настройки магазина</b>\n{DIV}\n"
         f"🏪 Название: <b>{escape(shop_name())}</b>\n"
         f"📢 Канал: <code>{escape(str(channel_id()))}</code>\n"
-        f"💬 Поддержка: {('@' + escape(support_username())) if support_username() else '—'}\n"
-        f"🖼 Баннер: {'есть' if get_setting('banner') else 'нет'}\n\n"
+        f"💬 Поддержка: {('@' + escape(support_username())) if support_username() else '—'}"
+        f" / {escape(support_email()) or '—'}\n"
+        f"🖼 Баннер: {'есть' if get_setting('banner') else 'нет'}\n"
+        f"📄 Соглашение: {doc_status('terms')}\n"
+        f"🔐 Политика: {doc_status('privacy')}\n"
+        f"📝 Описание бота: {'есть' if get_setting('bot_description') else 'нет'}\n"
+        f"💰 Лимит цены: {fmt_price(MAX_PRICE)}\n\n"
         "Выберите, что изменить:"
     )
 
@@ -1176,6 +1332,32 @@ async def setting_save(m: Message, state: FSMContext, bot: Bot):
             value = value[:2000]
         elif key == "shop_name":
             value = value[:50]
+        elif key == "support_email":
+            if value and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+                await m.answer("Это не похоже на почту. Пример: <code>support@gmail.com</code>. Ещё раз:")
+                return
+        elif key in ("terms", "privacy"):
+            if not is_url(value):
+                value = (m.text or "").strip() if value else ""
+                value = value[:4000]
+        elif key == "bot_description":
+            if len(value) > 512:
+                await m.answer(f"Слишком длинно: {len(value)} символов, можно до 512. Сократите:")
+                return
+            try:
+                await bot.set_my_description(description=value)
+            except Exception as e:
+                await m.answer(f"⚠️ Telegram не принял описание: {escape(str(e))}")
+                return
+        elif key == "bot_short":
+            if len(value) > 120:
+                await m.answer(f"Слишком длинно: {len(value)} символов, можно до 120. Сократите:")
+                return
+            try:
+                await bot.set_my_short_description(short_description=value)
+            except Exception as e:
+                await m.answer(f"⚠️ Telegram не принял описание: {escape(str(e))}")
+                return
         set_setting(key, value)
     await state.clear()
     await m.answer("✅ Сохранено.")
