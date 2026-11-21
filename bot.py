@@ -133,6 +133,8 @@ def init_db() -> None:
         _add_column(c, "products", "photo_id", "TEXT")
         _add_column(c, "orders", "orig_price", "REAL")
         _add_column(c, "orders", "promo", "TEXT")
+        _add_column(c, "orders", "proof_id", "TEXT")
+        _add_column(c, "orders", "proof_type", "TEXT")
 
 
 def now() -> str:
@@ -392,6 +394,10 @@ class PromoInput(StatesGroup):
     code = State()
 
 
+class PaymentProof(StatesGroup):
+    screenshot = State()
+
+
 # ─────────────────────────── Клавиатуры ───────────────────────────
 
 BTN_CATALOG = "🛍 Каталог"
@@ -442,6 +448,29 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 def back_kb(to: str = "adm:menu") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад", callback_data=to)]])
+
+
+def admin_order_caption(o, who: str | None = None) -> str:
+    who = who or f"<code>{o['user_id']}</code>"
+    promo = f"\n🎟 Промокод: <code>{escape(o['promo'])}</code>" if o["promo"] else ""
+    return (
+        f"💸 <b>Оплата на проверку — заказ #{o['id']}</b>\n{DIV}\n"
+        f"👤 Покупатель: {who} (<code>{o['user_id']}</code>)\n"
+        f"🛍 Товар: {escape(o['product_name'])}\n"
+        f"💰 Сумма: <b>{fmt_price(o['price'])}</b>{promo}\n"
+        f"🕒 {o['updated_at']}\n\n"
+        "Сверьте скриншот с поступлением и выдайте товар."
+    )
+
+
+async def send_proof(bot: Bot, chat_id: int, o, caption: str) -> None:
+    kb = admin_order_kb(o["id"])
+    if o["proof_type"] == "photo":
+        await bot.send_photo(chat_id, o["proof_id"], caption=caption, reply_markup=kb)
+    elif o["proof_type"] == "document":
+        await bot.send_document(chat_id, o["proof_id"], caption=caption, reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, caption, reply_markup=kb)
 
 
 def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
@@ -669,36 +698,60 @@ async def promo_apply(m: Message, state: FSMContext):
 
 
 @user_router.callback_query(F.data.startswith("paid:"))
-async def cb_paid(cq: CallbackQuery, bot: Bot):
+async def cb_paid(cq: CallbackQuery, state: FSMContext):
     oid = int(cq.data.split(":")[1])
     with db() as c:
         o = c.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (oid, cq.from_user.id)).fetchone()
-        if not o or o["status"] != "new":
-            await cq.answer("Этот заказ уже обработан", show_alert=True)
-            return
-        c.execute("UPDATE orders SET status='paid', updated_at=? WHERE id=?", (now(), oid))
+    if not o or o["status"] != "new":
+        await cq.answer("Этот заказ уже обработан", show_alert=True)
+        return
+    await state.set_state(PaymentProof.screenshot)
+    await state.update_data(oid=oid)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="« Назад к заказу", callback_data=f"ordv:{oid}")]]
+    )
     await safe_edit(
         cq.message,
+        f"📸 <b>Заказ #{oid}</b>\n{DIV}\n"
+        "Отправьте сюда <b>скриншот или чек оплаты</b>: фото или файл (PDF).\n\n"
+        "На скриншоте должны быть видны сумма, дата и получатель.",
+        kb,
+    )
+    await cq.answer()
+
+
+@user_router.message(PaymentProof.screenshot, F.photo | F.document)
+async def payment_proof(m: Message, state: FSMContext, bot: Bot):
+    oid = (await state.get_data())["oid"]
+    if m.photo:
+        proof_id, proof_type = m.photo[-1].file_id, "photo"
+    else:
+        proof_id, proof_type = m.document.file_id, "document"
+    with db() as c:
+        o = c.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (oid, m.from_user.id)).fetchone()
+        if not o or o["status"] != "new":
+            await state.clear()
+            await m.answer("Этот заказ уже обработан.")
+            return
+        c.execute(
+            "UPDATE orders SET status='paid', proof_id=?, proof_type=?, updated_at=? WHERE id=?",
+            (proof_id, proof_type, now(), oid),
+        )
+        o = c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    await state.clear()
+    await m.answer(
         f"🔎 <b>Заказ #{oid}</b> передан на проверку.\n\n"
         "Как только оплата подтвердится, товар придёт в этот чат. Обычно это занимает немного времени.",
+        reply_markup=main_kb(m.from_user.id),
     )
-    u = cq.from_user
+    u = m.from_user
     who = f"@{u.username}" if u.username else escape(u.full_name)
-    promo = f"\n🎟 Промокод: <code>{escape(o['promo'])}</code>" if o["promo"] else ""
+    caption = admin_order_caption(o, who)
     for admin in ADMIN_IDS:
         try:
-            await bot.send_message(
-                admin,
-                f"💸 <b>Новая оплата — заказ #{oid}</b>\n{DIV}\n"
-                f"👤 Покупатель: {who} (<code>{u.id}</code>)\n"
-                f"🛍 Товар: {escape(o['product_name'])}\n"
-                f"💰 Сумма: <b>{fmt_price(o['price'])}</b>{promo}\n\n"
-                "Проверьте поступление и выдайте товар.",
-                reply_markup=admin_order_kb(oid),
-            )
+            await send_proof(bot, admin, o, caption)
         except Exception as e:
             logging.warning("Не удалось уведомить админа %s: %s", admin, e)
-    await cq.answer()
 
 
 @user_router.callback_query(F.data.startswith("cancel:"))
@@ -842,6 +895,11 @@ async def cb_doc(cq: CallbackQuery):
         for i, chunk in enumerate(chunks):
             await cq.message.answer((title if i == 0 else "") + chunk)
     await cq.answer()
+
+
+@user_router.message(PaymentProof.screenshot)
+async def payment_proof_wrong(m: Message):
+    await m.answer("📸 Пришлите, пожалуйста, скриншот оплаты (фото) или чек файлом.")
 
 
 # ─────────────────────────── Админка ───────────────────────────
@@ -1093,15 +1151,7 @@ async def adm_pending(cq: CallbackQuery):
         return
     await cq.answer()
     for o in rows:
-        promo = f"\n🎟 Промокод: <code>{escape(o['promo'])}</code>" if o["promo"] else ""
-        await cq.message.answer(
-            f"🔎 <b>Заказ #{o['id']}</b>\n"
-            f"👤 Покупатель: <code>{o['user_id']}</code>\n"
-            f"🛍 Товар: {escape(o['product_name'])}\n"
-            f"💰 Сумма: <b>{fmt_price(o['price'])}</b>{promo}\n"
-            f"🕒 Создан: {o['created_at']}",
-            reply_markup=admin_order_kb(o["id"]),
-        )
+        await send_proof(cq.bot, cq.from_user.id, o, admin_order_caption(o))
 
 
 @admin_router.callback_query(F.data == "adm:orders")
